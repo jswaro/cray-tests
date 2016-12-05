@@ -83,7 +83,6 @@ typedef struct buf_desc {
 	uint64_t key;
 } buf_desc_t;
 
-
 struct per_thread_data {
 	pthread_t thread;
 	int tid; /* thread id */
@@ -106,6 +105,10 @@ struct per_thread_data {
 	uint64_t time_start;
 	uint64_t time_end;
 	fabtests_tbar_t tbar;
+	double avg_write_api_time;
+	uint64_t write_api_time;
+	double avg_cq_api_time;
+	uint64_t cq_api_time;
 };
 
 struct per_iteration_data {
@@ -119,6 +122,15 @@ struct per_iteration_data {
 };
 
 
+uint64_t get_elapsed_time(struct timeval *start, struct timeval *end)
+{
+	uint64_t s = (start->tv_sec * 1000000) + start->tv_usec;
+	uint64_t e = (end->tv_sec *   1000000) + end->tv_usec;
+
+	return e - s;
+}
+
+static struct timeval start_time, end_time;
 static pthread_barrier_t thread_barrier;
 struct per_thread_data *thread_data;
 struct fi_info *fi, *hints;
@@ -168,10 +180,11 @@ static void cq_readerr(struct fid_cq *cq, const char *cq_str)
 /*
  * fi_cq_err_entry can be cast to any CQ entry format.
  */
-static int wait_for_comp(struct fid_cq *cq, int num_completions)
+static int wait_for_comp(struct fid_cq *cq, int num_completions, uint64_t *elapsed)
 {
 	struct fi_cq_err_entry comp;
 	int ret;
+	uint64_t found = 0;
 
 	while (num_completions > 0) {
 		ret = fi_cq_read(cq, &comp, 1);
@@ -186,6 +199,7 @@ static int wait_for_comp(struct fid_cq *cq, int num_completions)
 			return ret;
 		}
 	}
+
 	return 0;
 }
 
@@ -283,6 +297,10 @@ static int init_fabric(void)
 	int ret;
 	uint64_t flags = 0;
 
+	hints->domain_attr->threading = FI_THREAD_COMPLETION;
+	hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+	hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
+
 	/* Get fabric info */
 	ret = fi_getinfo(CT_FIVERSION, NULL, NULL, flags, hints, &fi);
 	if (ret) {
@@ -295,13 +313,6 @@ static int init_fabric(void)
 	if (ret) {
 		ct_print_fi_error("fi_fabric", ret);
 		goto err1;
-	}
-
-
-	if (!thread_safe) {
-		fi->domain_attr->threading = FI_THREAD_COMPLETION;
-		fi->domain_attr->data_progress = FI_PROGRESS_MANUAL;
-		fi->domain_attr->control_progress = FI_PROGRESS_MANUAL;
 	}
 
 	/* Open domain */
@@ -461,6 +472,7 @@ void *thread_fn(void *data)
 	struct per_thread_data *ptd;
 	struct per_iteration_data it;
 	uint64_t t_start = 0, t_end = 0;
+	uint64_t events = loop * window_size;
 
 	it.data = data;
 	size = it.message_size;
@@ -470,6 +482,8 @@ void *thread_fn(void *data)
 
 	ptd = &thread_data[it.thread_id];
 	ptd->bytes_sent = 0;
+	ptd->write_api_time = 0;
+	ptd->cq_api_time = 0;
 
         ct_tbarrier(&ptd->tbar);
 
@@ -483,31 +497,43 @@ void *thread_fn(void *data)
 			}
 
 			for (j = 0; j < window_size; j++) {
+				gettimeofday(&start_time, NULL);
 				fi_rc = fi_write(ptd->ep, ptd->s_buf, size, ptd->l_mr,
 						ptd->fi_addrs[peer],
 						ptd->rbuf_descs[peer].addr,
 						ptd->rbuf_descs[peer].key,
 						(void *)(intptr_t)j);
+				gettimeofday(&end_time, NULL);
+				if (i >= skip) {
+					ptd->write_api_time += get_elapsed_time(&start_time, &end_time);
+				}
+
 				assert(fi_rc==FI_SUCCESS);
 				ptd->bytes_sent += size;
 			}
 
-			wait_for_comp(ptd->scq, window_size);
+			gettimeofday(&start_time, NULL);
+			wait_for_comp(ptd->scq, window_size, NULL);
+			gettimeofday(&end_time, NULL);
+			if (i >= skip) {
+				ptd->cq_api_time += get_elapsed_time(&start_time, &end_time);
+			}
 		}
+
+		t_end = get_time_usec();
 
 		fi_rc = fi_send(ptd->ep, ptd->s_buf, 4, NULL,
 				ptd->fi_addrs[peer],
 				NULL);
 		assert(!fi_rc);
-		wait_for_comp(ptd->scq, 1);
+		wait_for_comp(ptd->scq, 1, NULL);
 
 		fi_rc = fi_recv(ptd->ep, ptd->s_buf, 4, NULL,
 				ptd->fi_addrs[peer],
 				NULL);
 		assert(!fi_rc);
-		wait_for_comp(ptd->rcq, 1);
+		wait_for_comp(ptd->rcq, 1, NULL);
 
-		t_end = get_time_usec();
 	} else if (myid == 1) {
 		peer = 0;
 
@@ -515,17 +541,19 @@ void *thread_fn(void *data)
 				ptd->fi_addrs[peer],
 				NULL);
 		assert(!fi_rc);
-		wait_for_comp(ptd->rcq, 1);
+		wait_for_comp(ptd->rcq, 1, NULL);
 
 		fi_rc = fi_send(ptd->ep, ptd->s_buf, 4, NULL,
 				ptd->fi_addrs[peer],
 				NULL);
 		assert(!fi_rc);
-		wait_for_comp(ptd->scq, 1);
+		wait_for_comp(ptd->scq, 1, NULL);
 	}
 
         ct_tbarrier(&ptd->tbar);
 
+	ptd->avg_write_api_time = ptd->write_api_time / ((double)(loop * window_size));
+	ptd->avg_cq_api_time = ptd->cq_api_time / ((double)(loop * window_size));
 	ptd->latency = (t_end - t_start) / (double)(loop * window_size);
 	ptd->time_start = t_start;
 	ptd->time_end = t_end;
@@ -540,6 +568,7 @@ int main(int argc, char *argv[])
 	struct per_iteration_data iter_key;
 	struct per_thread_data *ptd;
 	double min_lat, max_lat, sum_lat;
+	double avg_write_api_time, avg_cq_api_time;
 	uint64_t time_start, time_end;
 	uint64_t bytes_sent;
 	double mbps;
@@ -642,11 +671,13 @@ int main(int argc, char *argv[])
 
 	if (myid == 0) {
 		fprintf(stdout, HEADER);
-		fprintf(stdout, "%-*s%*s%*s%*s%*s\n", 10, "# Size",
+		fprintf(stdout, "%-*s%*s%*s%*s%*s%*s%*s\n", 10, "# Size",
 			FIELD_WIDTH, "Bandwidth (MB/s)",
 			FIELD_WIDTH, "Latency (us)",
 			FIELD_WIDTH, "Min Lat (us)",
-			FIELD_WIDTH, "Max Lat (us)");
+			FIELD_WIDTH, "Max Lat (us)",
+			FIELD_WIDTH, "Avg Write API(us)",
+			FIELD_WIDTH, "Avg CQ API(us)");
 		fflush(stdout);
 	}
 
@@ -694,6 +725,8 @@ int main(int argc, char *argv[])
 			bytes_sent = thread_data[0].bytes_sent;
 			time_start = thread_data[0].time_start;
 			time_end = thread_data[0].time_end;
+			avg_write_api_time = thread_data[0].avg_write_api_time;
+			avg_cq_api_time = thread_data[0].avg_cq_api_time;
 
 			for (i = 1; i < tunables.threads; i++) {
 				if (thread_data[i].latency < min_lat) {
@@ -702,6 +735,9 @@ int main(int argc, char *argv[])
 					max_lat = thread_data[i].latency;
 				}
 				sum_lat += thread_data[i].latency;
+
+				avg_write_api_time = thread_data[i].avg_write_api_time;
+				avg_cq_api_time = thread_data[i].avg_cq_api_time;
 
 				bytes_sent += thread_data[i].bytes_sent;
 
@@ -713,13 +749,17 @@ int main(int argc, char *argv[])
 			}
 
 			mbps = ((bytes_sent * 1.0) / (1024. * 1024.)) / ((time_end - time_start) / (1.0 * 1e6));
+			avg_write_api_time /= (double) tunables.threads;
+			avg_cq_api_time /= (double) tunables.threads;
 
-			fprintf(stdout, "%-*d%*.*f%*.*f%*.*f%*.*f\n", 10, size,
+			fprintf(stdout, "%-*d%*.*f%*.*f%*.*f%*.*f%*.*f%*.*f\n", 10, size,
 				FIELD_WIDTH, FLOAT_PRECISION, mbps,
 				FIELD_WIDTH, FLOAT_PRECISION,
 				sum_lat / tunables.threads,
 				FIELD_WIDTH, FLOAT_PRECISION, min_lat,
-				FIELD_WIDTH, FLOAT_PRECISION, max_lat);
+				FIELD_WIDTH, FLOAT_PRECISION, max_lat,
+				FIELD_WIDTH, FLOAT_PRECISION, avg_write_api_time,
+				FIELD_WIDTH, FLOAT_PRECISION, avg_cq_api_time);
 			fflush(stdout);
 		}
 

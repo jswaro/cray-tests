@@ -102,13 +102,13 @@ struct per_thread_data {
 	buf_desc_t *rbuf_descs;
 	double latency;
 	uint64_t bytes_sent;
-	uint64_t time_start;
-	uint64_t time_end;
+	double time_start;
+	double time_end;
 	fabtests_tbar_t tbar;
 	double avg_write_api_time;
-	uint64_t write_api_time;
+	double write_api_time;
 	double avg_cq_api_time;
-	uint64_t cq_api_time;
+	double cq_api_time;
 };
 
 struct per_iteration_data {
@@ -120,6 +120,14 @@ struct per_iteration_data {
 		void *data;
 	};
 };
+
+static inline double get_time_nsec(void) 
+{
+	struct timespec tv;
+	clock_gettime(CLOCK_MONOTONIC, &tv);
+	return tv.tv_sec + (tv.tv_nsec / 1000000000.0);
+}
+
 
 
 uint64_t get_elapsed_time(struct timeval *start, struct timeval *end)
@@ -473,6 +481,11 @@ void *thread_fn(void *data)
 	struct per_iteration_data it;
 	uint64_t t_start = 0, t_end = 0;
 	uint64_t events = loop * window_size;
+	double total_write_time, total_cq_time, total_tx_time;
+	double start_time, end_time;
+	double total_test_time;
+	double start_test_time, end_test_time;
+	
 
 	it.data = data;
 	size = it.message_size;
@@ -487,40 +500,42 @@ void *thread_fn(void *data)
 
         ct_tbarrier(&ptd->tbar);
 
+	total_tx_time = total_write_time = total_cq_time = 0.0;
+	start_test_time = get_time_nsec();
 	if (myid == 0) {
 		peer = 1;
 
 		for (i = 0; i < loop + skip; i++) {
 			if (i == skip) {  /* warm up loop */
-				t_start = get_time_usec();
+				t_start = get_time_nsec();
 				ptd->bytes_sent = 0;
 			}
 
+			start_time = get_time_nsec();
 			for (j = 0; j < window_size; j++) {
-				gettimeofday(&start_time, NULL);
 				fi_rc = fi_write(ptd->ep, ptd->s_buf, size, ptd->l_mr,
 						ptd->fi_addrs[peer],
 						ptd->rbuf_descs[peer].addr,
 						ptd->rbuf_descs[peer].key,
 						(void *)(intptr_t)j);
-				gettimeofday(&end_time, NULL);
-				if (i >= skip) {
-					ptd->write_api_time += get_elapsed_time(&start_time, &end_time);
-				}
 
 				assert(fi_rc==FI_SUCCESS);
 				ptd->bytes_sent += size;
 			}
+			end_time = get_time_nsec();
 
-			gettimeofday(&start_time, NULL);
+			if (i >= skip)
+				total_write_time += (end_time - start_time);
+
+			start_time = get_time_nsec();
 			wait_for_comp(ptd->scq, window_size, NULL);
-			gettimeofday(&end_time, NULL);
-			if (i >= skip) {
-				ptd->cq_api_time += get_elapsed_time(&start_time, &end_time);
-			}
-		}
+			end_time = get_time_nsec();
 
-		t_end = get_time_usec();
+			if (i >= skip)
+				total_cq_time += (end_time - start_time);
+		}
+		end_test_time = get_time_nsec();
+		t_end = get_time_nsec();
 
 		fi_rc = fi_send(ptd->ep, ptd->s_buf, 4, NULL,
 				ptd->fi_addrs[peer],
@@ -551,12 +566,17 @@ void *thread_fn(void *data)
 	}
 
         ct_tbarrier(&ptd->tbar);
+	total_tx_time = total_write_time + total_cq_time;
 
-	ptd->avg_write_api_time = ptd->write_api_time / ((double)(loop * window_size));
-	ptd->avg_cq_api_time = ptd->cq_api_time / ((double)(loop * window_size));
-	ptd->latency = (t_end - t_start) / (double)(loop * window_size);
-	ptd->time_start = t_start;
-	ptd->time_end = t_end;
+//	printf("%0.9f %0.9f %0.9f\n", total_write_time, total_cq_time, total_tx_time);
+
+	ptd->avg_write_api_time = total_write_time / ((double)(loop * window_size));
+	ptd->avg_cq_api_time = total_cq_time / ((double)(loop * window_size));
+	ptd->latency = (total_write_time + total_cq_time) / ((double)(loop * window_size));
+	ptd->time_start = start_test_time;
+	ptd->time_end = end_test_time;
+
+//	printf("%0.9f %0.9f %0.9f\n", total_write_time / ((double)(loop * window_size)), total_cq_time / ((double)(loop * window_size)), (total_write_time + total_cq_time) / ((double)(loop * window_size))); 
 
 	return NULL;
 }
@@ -569,7 +589,7 @@ int main(int argc, char *argv[])
 	struct per_thread_data *ptd;
 	double min_lat, max_lat, sum_lat;
 	double avg_write_api_time, avg_cq_api_time;
-	uint64_t time_start, time_end;
+	double time_start, time_end;
 	uint64_t bytes_sent;
 	double mbps;
 
@@ -748,18 +768,19 @@ int main(int argc, char *argv[])
 					time_end = thread_data[i].time_end;
 			}
 
-			mbps = ((bytes_sent * 1.0) / (1024. * 1024.)) / ((time_end - time_start) / (1.0 * 1e6));
+			mbps = (bytes_sent / (time_end - time_start)) / (1024. * 1024.);
+
 			avg_write_api_time /= (double) tunables.threads;
 			avg_cq_api_time /= (double) tunables.threads;
-
+#define SEC2USEC (1.0 * 1000 * 1000)
 			fprintf(stdout, "%-*d%*.*f%*.*f%*.*f%*.*f%*.*f%*.*f\n", 10, size,
 				FIELD_WIDTH, FLOAT_PRECISION, mbps,
 				FIELD_WIDTH, FLOAT_PRECISION,
-				sum_lat / tunables.threads,
-				FIELD_WIDTH, FLOAT_PRECISION, min_lat,
-				FIELD_WIDTH, FLOAT_PRECISION, max_lat,
-				FIELD_WIDTH, FLOAT_PRECISION, avg_write_api_time,
-				FIELD_WIDTH, FLOAT_PRECISION, avg_cq_api_time);
+				sum_lat / tunables.threads * SEC2USEC,
+				FIELD_WIDTH, FLOAT_PRECISION, min_lat * SEC2USEC,
+				FIELD_WIDTH, FLOAT_PRECISION, max_lat * SEC2USEC,
+				FIELD_WIDTH, FLOAT_PRECISION, avg_write_api_time * SEC2USEC,
+				FIELD_WIDTH, FLOAT_PRECISION, avg_cq_api_time * SEC2USEC);
 			fflush(stdout);
 		}
 

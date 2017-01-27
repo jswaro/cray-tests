@@ -148,7 +148,7 @@
 	} while (0)
 #define VERBOSE(fmt, args...) PRINT(stdout,"rank %d: " fmt, rank, ##args)
 #define ERROR(fmt, args...) PRINT(stderr, fmt, ##args)
-#if 1 
+#if 0 
 # define DEBUG(fmt, args...) ;
 #else
 # define DEBUG(fmt, args...) \
@@ -219,6 +219,7 @@
 #define SCRATCH_SIZE 8
 
 /* global variables */
+int scalable;
 double gups;
 double errors_fraction;
 double check_time;
@@ -409,6 +410,10 @@ static inline void lf_atomic_xor(void *addr, uint64_t val, int remote_rank)
 	key = p->data.r_table_key;
 	*(uint64_t *)tmp = val;
 
+	if (scalable) {
+		rem_addr = ((uint64_t)addr) - ((uint64_t)hpcc_table);
+	} 
+	
 	rc = fi_atomic(ep, tmp, 1, fi_mr_desc(data->l_scratch_mr), dest_addr,
 			rem_addr, key, FI_UINT64, FI_BXOR, NULL);
 
@@ -527,6 +532,8 @@ static inline int init_fabric(fabric_t *fabric)
 		ct_print_fi_error("fi_getinfo", ret);
 		return ret;
 	}
+
+	VERBOSE("Using %s provider\n", fabric->info->fabric_attr->prov_name);
 
 	/* Open fabric */
 	ret = fi_fabric(fabric->info->fabric_attr, &fabric->fab, NULL);
@@ -724,6 +731,15 @@ static int random_access(void)
 	double MyGUPS;
 	double *local_gups_score;
 	int rc;
+	int table_req_key = 0;
+	int lock_req_key = 0;
+	int scratch_req_key = 0;
+
+	if (scalable) {
+		table_req_key = 1;
+		lock_req_key = 2;
+		scratch_req_key = 3;
+	}	
 
 	local_gups_score = &MyGUPS;
 
@@ -790,19 +806,19 @@ static int random_access(void)
 	/* register memory */
 	rc = fi_mr_reg(prov.dom, hpcc_table, local_table_size * sizeof(uint64_t),
 			FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV | FI_READ
-					| FI_WRITE, 0, 0, 0, &prov.data.l_table_mr, NULL);
+					| FI_WRITE, 0, table_req_key, 0, &prov.data.l_table_mr, NULL);
 	if (rc != FI_SUCCESS)
 		DEBUG("rc=%d\n", rc);
 	assert(rc == FI_SUCCESS);
 
 	rc = fi_mr_reg(prov.dom, hpcc_lock, sizeof(uint64_t) * num_ranks,
 			FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV | FI_READ
-					| FI_WRITE, 0, 0, 0, &prov.data.l_lock_mr, NULL);
+					| FI_WRITE, 0, lock_req_key, 0, &prov.data.l_lock_mr, NULL);
 	assert(rc == FI_SUCCESS);
 
 	rc = fi_mr_reg(prov.dom, scratch, sizeof(uint32_t) * SCRATCH_SIZE,
 			FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV | FI_READ
-					| FI_WRITE, 0, 0, 0, &prov.data.l_scratch_mr, NULL);
+					| FI_WRITE, 0, scratch_req_key, 0, &prov.data.l_scratch_mr, NULL);
 	assert(rc == FI_SUCCESS);
 
 	/* distribute memory keys */
@@ -964,9 +980,8 @@ static inline void fini_gnix_prov(fabric_t *fabric)
 
 	// close all endpoints
 	for (i = 0; i < num_ranks; i++) {
-		free_ep_res(fabric, i);
-
 		fi_close(&fabric->peers[i].ep->fid);
+		free_ep_res(fabric, i);
 	}
 
 	if (fabric->av) {
@@ -1010,7 +1025,7 @@ int main(int argc, char **argv)
 
 	hints = prov.hints;
 
-	while ((op = getopt(argc, argv, "hm:n:" CT_STD_OPTS)) != -1) {
+	while ((op = getopt(argc, argv, "hm:n:f:" CT_STD_OPTS)) != -1) {
 		switch(op) {
 		default:
 			ct_parse_std_opts(op, optarg, hints);
@@ -1018,6 +1033,17 @@ int main(int argc, char **argv)
 		/*
 		 * memory per PE (used for determining table size)
 		 */
+		case 'f':
+			if (!hints->fabric_attr) {
+		 		hints->fabric_attr = malloc(sizeof *(hints->fabric_attr));
+				if (!hints->fabric_attr) {
+					perror("malloc");
+					exit(EXIT_FAILURE);
+				}
+			}
+			hints->fabric_attr->prov_name = strdup(optarg);
+
+			break;
 		case 'm':
 			tunables.total_mem_opt = atoll(optarg);
 			if (tunables.total_mem_opt <= 0) {
@@ -1042,12 +1068,11 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 	}
-
+	
 	// modify hints as needed prior to fabric initialization
 	hints->ep_attr->type = FI_EP_RDM;
-	hints->caps = FI_TAGGED | FI_DIRECTED_RECV;
 	hints->mode = FI_CONTEXT | FI_LOCAL_MR;
-	hints->caps |= GNIX_EP_RDM_PRIMARY_CAPS;
+	hints->caps = FI_ATOMICS;
 
 	if (!thread_safe) {
 		hints->domain_attr->threading = FI_THREAD_COMPLETION;
@@ -1055,7 +1080,10 @@ int main(int argc, char **argv)
 		hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
 	}
 
-	// initialize the gnix provider fabric
+	hints->domain_attr->mr_mode = FI_MR_SCALABLE;
+	scalable = 1;
+
+	// initialize the provider fabric
 	init_gnix_prov(&prov);
 
 	// run random access test
@@ -1063,7 +1091,7 @@ int main(int argc, char **argv)
 	random_access();
 	ctpm_Barrier();
 
-	// close the gnix provider fabric
+	// close the provider fabric
 	fini_gnix_prov(&prov);
 
 	// barrier and finalize

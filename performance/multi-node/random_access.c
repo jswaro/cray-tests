@@ -542,6 +542,8 @@ static inline int init_fabric(fabric_t *fabric)
 		goto err_fabric_open;
 	}
 
+	scalable = !!(fabric->info->domain_attr->mr_mode & FI_MR_SCALABLE);
+
 	/* Open domain */
 	ret = fi_domain(fabric->fab, fabric->info, &fabric->dom, NULL);
 	if (unlikely(ret)) {
@@ -1024,8 +1026,9 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 
 	hints = prov.hints;
+	hints->domain_attr->mr_mode = FI_MR_BASIC;
 
-	while ((op = getopt(argc, argv, "hm:n:f:" CT_STD_OPTS)) != -1) {
+	while ((op = getopt(argc, argv, "hm:n:f:s" CT_STD_OPTS)) != -1) {
 		switch(op) {
 		default:
 			ct_parse_std_opts(op, optarg, hints);
@@ -1062,6 +1065,9 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			break;
+		case 's':
+			hints->domain_attr->mr_mode = FI_MR_SCALABLE;
+			break;
 		case '?':
 		case 'h':
 			print_usage();
@@ -1079,9 +1085,6 @@ int main(int argc, char **argv)
 		hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
 		hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
 	}
-
-	hints->domain_attr->mr_mode = FI_MR_SCALABLE;
-	scalable = 1;
 
 	// initialize the provider fabric
 	init_gnix_prov(&prov);

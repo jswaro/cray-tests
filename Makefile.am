@@ -6,6 +6,7 @@ bin_PROGRAMS = \
 	performance/multi-node/rdm_pingpong \
 	performance/multi-node/rdm_one_sided \
 	performance/multi-node/random_access \
+	performance/multi-node/auth_key_test \
 	performance/single-node/lock_tests \
 	performance/single-node/builtin_atomic_tests
 
@@ -35,6 +36,10 @@ performance_multi_node_rdm_one_sided_LDADD = libcraytests.la
 performance_multi_node_random_access_SOURCES = \
         performance/multi-node/random_access.c
 performance_multi_node_random_access_LDADD = libcraytests.la
+
+performance_multi_node_auth_key_test_SOURCES = \
+        performance/multi-node/auth_key_test.c
+performance_multi_node_auth_key_test_LDADD = libcraytests.la
 
 ################################################################################
 # Single-node sources

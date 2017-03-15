@@ -118,7 +118,7 @@
  * Benchmark,and the rules to run RandomAccess or modify it to optimize
  * performance -- see http://icl.cs.utk.edu/hpcc/
  */
-#include <config.h>
+
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -138,13 +138,8 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
 #include <rdma/fi_atomic.h>
-#include <rdma/fi_ext_gni.h>
 
 #include "ct_utils.h"
-
-#if HAVE_DRC
-#include "rdmacred.h"
-#endif
 
 #define PRINT(stream, fmt, args...) \
 	do { \
@@ -204,7 +199,6 @@ double errors_fraction;
 double check_time;
 int failure;
 uint32_t scratch[SCRATCH_SIZE];
-static struct fi_gni_auth_key auth_key;
 
 /* Allocate main table (in global memory) */
 uint64_t *hpcc_table;
@@ -255,7 +249,6 @@ uint64_t saved_initial_ran_val;
 struct test_tunables {
 	uint64_t total_mem_opt;
 	int num_updates_opt;
-	int use_drc;
 };
 
 static struct test_tunables tunables = {0};
@@ -509,9 +502,6 @@ static inline int init_fabric(fabric_t *fabric)
 		ct_print_fi_error("fi_getinfo", ret);
 		return ret;
 	}
-
-	fabric->info->domain_attr->auth_key = (uint8_t *) &auth_key;
-	fabric->info->domain_attr->auth_keylen = sizeof(struct fi_gni_auth_key);
 
 	/* Open fabric */
 	ret = fi_fabric(fabric->info->fabric_attr, &fabric->fab, NULL);
@@ -993,11 +983,7 @@ int main(int argc, char **argv)
 	int size;
 	int op, ret;
 	struct fi_info *hints;
-#if HAVE_DRC
-	int credential;
-	int *credential_arr;
-	drc_info_handle_t info;
-#endif
+
 	ctpm_Init(&argc, &argv);
 	ctpm_Rank(&rank);
 	ctpm_Job_size(&num_ranks);
@@ -1008,7 +994,7 @@ int main(int argc, char **argv)
 
 	hints = prov.hints;
 
-	while ((op = getopt(argc, argv, "hm:n:d" CT_STD_OPTS)) != -1) {
+	while ((op = getopt(argc, argv, "hm:n:" CT_STD_OPTS)) != -1) {
 		switch(op) {
 		default:
 			ct_parse_std_opts(op, optarg, hints);
@@ -1034,52 +1020,12 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			break;
-		case 'd':
-			tunables.use_drc = 1;
-			break;
 		case '?':
 		case 'h':
 			print_usage();
 			return EXIT_FAILURE;
 		}
 	}
-
-#if HAVE_DRC
-	if (tunables.use_drc) {
-		auth_key.type = GNIX_AKT_RAW;
-
-		if (HEAD_RANK) {
-			ret = drc_acquire(&credential, 0);
-			if (ret) {
-				ERROR("failed to acquire credential, ret=%d\n", ret);
-				exit(-1);
-			}
-		}
-
-		ctpm_Bcast(&credential, sizeof(int));
-
-		ret = drc_access(credential, 0, &info);
-		if (ret) {
-			ERROR("failed to access credential, ret=%d\n", ret);
-			if (HEAD_RANK) {
-				ret = drc_release(credential, 0);
-				if (ret)
-					ERROR("failed to release credential, ret=%d\n", ret);
-			}
-			exit(-1);
-		}
-
-		auth_key.raw.protection_key = drc_get_first_cookie(info);
-		VERBOSE("Using protection key %08x.\n", auth_key.raw.protection_key);
-	}
-#else
-	if (tunables.use_drc) {
-		ERROR("DRC is not enabled, so use of the "
-			"argument is invalid\n")
-		exit(-1);
-	}
-
-#endif
 
 	// modify hints as needed prior to fabric initialization
 	hints->ep_attr->type = FI_EP_RDM;
@@ -1103,11 +1049,6 @@ int main(int argc, char **argv)
 
 	// close the gnix provider fabric
 	fini_gnix_prov(&prov);
-
-#if HAVE_DRC
-	if (HEAD_RANK)
-		ret = drc_release(credential, 0);
-#endif
 
 	// barrier and finalize
 	ctpm_Barrier();

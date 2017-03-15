@@ -32,9 +32,11 @@ if pkg-config --exists cray-drc; then
 	LDFLAGS="$DRC_LIBS $LDFLAGS"
 	HAVE_DRC=1
 	AC_DEFINE([HAVE_DRC], [1], ["Does the project have access to DRC?"])
+	AM_CONDITIONAL([HAVE_DRC], [true])
 else
 	HAVE_DRC=0
 	AC_DEFINE([HAVE_DRC], [0], ["Does the project have access to DRC?"])
+	AM_CONDITIONAL([HAVE_DRC], [false])
 fi
 
 AC_SUBST([HAVE_DRC])

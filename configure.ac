@@ -25,19 +25,14 @@ AM_PROG_CC_C_O
 
 LT_INIT
 
-if pkg-config --exists cray-drc; then
-	DRC_CFLAGS=`pkg-config cray-drc --cflags`
-	DRC_LIBS=`pkg-config cray-drc --libs`
-	CPPFLAGS="$DRC_CFLAGS $CPPFLAGS"
-	LDFLAGS="$DRC_LIBS $LDFLAGS"
-	HAVE_DRC=1
-	AC_DEFINE([HAVE_DRC], [1], ["Does the project have access to DRC?"])
-	AM_CONDITIONAL([HAVE_DRC], [true])
-else
-	HAVE_DRC=0
-	AC_DEFINE([HAVE_DRC], [0], ["Does the project have access to DRC?"])
-	AM_CONDITIONAL([HAVE_DRC], [false])
-fi
+FI_PKG_CHECK_MODULES([DRC], [cray-drc],
+		     [CPPFLAGS="$DRC_CFLAGS $CPPFLAGS"
+		      LDFLAGS="$DRC_LIBS $LDFLAGS"
+		      drc_happy=1],
+		     [drc_happy=0])
+
+AC_DEFINE([HAVE_DRC], [$drc_happy], ["Does the project have access to DRC?"])
+AM_CONDITIONAL([HAVE_DRC], [test $drc_happy -eq 1])
 
 AC_SUBST([HAVE_DRC])
 
